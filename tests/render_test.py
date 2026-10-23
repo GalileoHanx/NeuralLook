@@ -95,10 +95,44 @@ stored_depth = (1 - lin_depth * FAR / (1 + lin_depth * (FAR - 1))).astype(np.flo
 Image.fromarray(color8).save(os.path.join(OUT, "original.png"))
 
 # --------------------------------------------------------------------------------------
+# Read uniform defaults from the .fx file, and the uniform/sampler layout from the GLSL
+# --------------------------------------------------------------------------------------
+import re
+
+fx_src = open(FX).read()
+defaults = {}
+for m in re.finditer(r"uniform\s+(int|float|bool)\s+(\w+)\s*<(.*?)>\s*(?:=\s*([^;]+))?;", fx_src, re.S):
+    kind, name, _, value = m.groups()
+    value = (value or "0").strip()
+    if kind == "bool":
+        defaults[name] = value == "true"
+    elif kind == "int":
+        defaults[name] = int(value)
+    else:
+        defaults[name] = float(value)
+
+glsl_src = open(glsl_path).read()
+ubo_block = re.search(r"uniform _Globals \{(.*?)\};", glsl_src, re.S).group(1)
+ubo_layout = re.findall(r"\b(int|uint|float|bool)\s+V_x(\w+);", ubo_block)
+sampler_layout = {name: int(b) for b, name in
+                  re.findall(r"layout\(binding = (\d+)\) uniform sampler2D V_x(\w+);", glsl_src)}
+unknown = [n for _, n in ubo_layout if n not in defaults]
+assert not unknown, f"uniforms missing from defaults: {unknown}"
+
+
+def pack_uniforms(values):
+    out = b""
+    for kind, name in ubo_layout:  # std140: every scalar is 4 bytes, 4-byte aligned
+        v = values[name]
+        out += struct.pack("<f", v) if kind == "float" else struct.pack("<i", int(v))
+    return out + b"\0" * (-len(out) % 16)
+
+
+# --------------------------------------------------------------------------------------
 # Run the technique pass by pass
 # --------------------------------------------------------------------------------------
 ctx = moderngl.create_standalone_context(backend="egl", require=430)
-head, body = open(glsl_path).read().split("\n", 1)
+head, body = glsl_src.split("\n", 1)
 
 
 def program(entry):
@@ -106,40 +140,60 @@ def program(entry):
                        fragment_shader=f"{head}\n#define E_x{entry}\n{body}")
 
 
-def texture(w, h, comps, dtype, data=None):
+def texture(w, h, comps, dtype, data=None, nearest=False):
     t = ctx.texture((w, h), comps, data, dtype=dtype)
-    t.filter = (moderngl.LINEAR, moderngl.LINEAR)
+    f = moderngl.NEAREST if nearest else moderngl.LINEAR
+    t.filter = (f, f)
     t.repeat_x = t.repeat_y = False
     return t
 
 
+font = Image.open(os.path.join(WORK, "reshade-shaders", "Textures", "FontAtlas.png")).convert("RGBA")
 hw, hh, qw, qh = W // 2, H // 2, W // 4, H // 4
+depth_real = stored_depth.tobytes()
+depth_blank = np.zeros((H, W), np.float32).tobytes()  # what ReShade binds when it finds no depth
 tex = {
-    "Back": texture(W, H, 4, "f1", np.dstack([color8, np.full((H, W), 255, np.uint8)]).tobytes()),
-    "Depth": texture(W, H, 1, "f4", stored_depth.tobytes()),
-    "Half": texture(hw, hh, 4, "f2"), "BlurA": texture(hw, hh, 4, "f2"), "Small": texture(hw, hh, 4, "f2"),
-    "Quart": texture(qw, qh, 4, "f2"), "QBlurA": texture(qw, qh, 4, "f2"), "Large": texture(qw, qh, 4, "f2"),
-    "AO": texture(hw, hh, 1, "f2"), "AOBlur": texture(hw, hh, 1, "f2"),
+    "ReShade_xBackBuffer": texture(W, H, 4, "f1", np.dstack([color8, np.full((H, W), 255, np.uint8)]).tobytes()),
+    "ReShade_xDepthBuffer": texture(W, H, 1, "f4", depth_real),
+    "NL_Half": texture(hw, hh, 4, "f2"), "NL_BlurA": texture(hw, hh, 4, "f2"), "NL_Small": texture(hw, hh, 4, "f2"),
+    "NL_Quart": texture(qw, qh, 4, "f2"), "NL_QBlurA": texture(qw, qh, 4, "f2"), "NL_Large": texture(qw, qh, 4, "f2"),
+    "NL_AO": texture(hw, hh, 1, "f2"), "NL_AOBlur": texture(hw, hh, 1, "f2"),
+    "NL_State": texture(1, 1, 1, "f2", nearest=True), "NL_StatePrev": texture(1, 1, 1, "f2", nearest=True),
+    "samplerText": texture(512, 512, 4, "f1", font.resize((512, 512)).tobytes()),
 }
+missing = [n for n in sampler_layout if n not in tex]
+assert not missing, f"no test texture for samplers: {missing}"
 final = texture(W, H, 4, "f1")
-bindings = ["Back", "Depth", "Half", "BlurA", "Small", "Quart", "QBlurA", "Large", "AO", "AOBlur"]
-passes = [("PS_NL_Down", "Half"), ("PS_NL_SmallH", "BlurA"), ("PS_NL_SmallV", "Small"),
-          ("PS_NL_DownQ", "Quart"), ("PS_NL_LargeH", "QBlurA"), ("PS_NL_LargeV", "Large"),
-          ("PS_NL_AO", "AO"), ("PS_NL_AOBlurH", "AOBlur"), ("PS_NL_AOBlurV", "AO"),
+passes = [("PS_NL_Down", "NL_Half"), ("PS_NL_SmallH", "NL_BlurA"), ("PS_NL_SmallV", "NL_Small"),
+          ("PS_NL_DownQ", "NL_Quart"), ("PS_NL_LargeH", "NL_QBlurA"), ("PS_NL_LargeV", "NL_Large"),
+          ("PS_NL_DepthCheck", "NL_State"), ("PS_NL_StateCopy", "NL_StatePrev"),
+          ("PS_NL_AO", "NL_AO"), ("PS_NL_AOBlurH", "NL_AOBlur"), ("PS_NL_AOBlurV", "NL_AO"),
           ("PS_NL_Composite", None)]
 programs = {entry: program(entry) for entry, _ in passes}
-ubo = ctx.buffer(reserve=80)
+ubo = ctx.buffer(reserve=max(16, len(pack_uniforms(defaults))))
 ubo.bind_to_uniform_block(0)
 
 
-def render(preset=2, master=1.0, compare=False, split=0.5, debug=0):
-    # Uniform block in declaration order (std140, all 4-byte scalars)
-    data = struct.pack("<i13fIfi", preset, master, 0.45, 0.40, 0.35, 0.25, 0.10, 0.55, 0.40, 0.35,
-                       0.5, 0.3, 70.0, 1.0, int(compare), split, debug)
-    ubo.write(data + b"\0" * (80 - len(data)))
+def set_depth(real):
+    tex["ReShade_xDepthBuffer"].write(depth_real if real else depth_blank)
+
+
+def set_state(v):
+    for n in ("NL_State", "NL_StatePrev"):
+        tex[n].write(np.array([v], np.float16).tobytes())
+
+
+def read_state():
+    return float(np.frombuffer(tex["NL_State"].read(), np.float16)[0])
+
+
+def render(**overrides):
+    values = dict(defaults)
+    values.update(overrides)
+    ubo.write(pack_uniforms(values))
     for entry, target in passes:
         out = final if target is None else tex[target]
-        for unit, name in enumerate(bindings):
+        for name, unit in sampler_layout.items():
             tex[name].use(unit)
         fbo = ctx.framebuffer([out])
         fbo.use()
@@ -151,23 +205,59 @@ def render(preset=2, master=1.0, compare=False, split=0.5, debug=0):
     return np.frombuffer(final.read(), np.uint8).reshape(H, W, 4)[..., :3].copy()
 
 
-runs = {"light": dict(preset=1), "balanced": dict(preset=2), "strong": dict(preset=3),
-        "strength_zero": dict(master=0.0), "debug_contact_shadows": dict(debug=1),
-        "debug_skin_mask": dict(debug=2), "debug_lighting_contrast": dict(debug=3),
-        "split_compare": dict(compare=True)}
 img = {}
-for name, kw in runs.items():
+
+
+def shot(name, **kw):
     img[name] = render(**kw)
     Image.fromarray(img[name]).save(os.path.join(OUT, f"{name}.png"))
+    return img[name]
+
+
+# Depth detection: one frame from each starting state
+set_depth(True); set_state(0.0); render()
+state_rises = read_state()
+set_depth(False); set_state(1.0); render()
+state_falls = read_state()
+
+# Game with depth (state settled at 1)
+set_depth(True); set_state(1.0)
+shot("light", NL_Preset=1); shot("balanced", NL_Preset=2); shot("strong", NL_Preset=3)
+shot("classic", NL_Preset=4)
+shot("strength_zero", NL_Master=0.0)
+shot("debug_shadows", NL_Debug=1); shot("debug_skin_mask", NL_Debug=2); shot("debug_lighting_contrast", NL_Debug=3)
+shot("split_compare", NL_Compare=True)
+shot("glow_off", NL_Glow=0.0)
+shot("lens_vignette", NL_Vignette=1.0)
+shot("grain_frame0", NL_Grain=1.0, NL_Frame=0); shot("grain_frame7", NL_Grain=1.0, NL_Frame=7)
+moods = ["neutral", "cinematic_warm", "survival_horror", "teal_orange", "golden_hour", "cold_night"]
+for k, mood in enumerate(moods):
+    shot(f"mood_{mood}", NL_Mood=k, NL_MoodStrength=1.0)
+shot("status_depth", NL_OverlayOpen=True)
+
+# Game without depth, like Resident Evil 0 (state settled at 0)
+set_depth(False); set_state(0.0)
+shot("nodepth_balanced", NL_Preset=2)
+shot("nodepth_classic", NL_Preset=4)
+shot("nodepth_debug_shadows", NL_Debug=1)
+shot("status_nodepth", NL_OverlayOpen=True)
 
 # Side-by-side close-up: original | balanced | strong
 box = (340, 170, 720, 460)
 strip = Image.new("RGB", (3 * 380 + 16, 290 + 34), (18, 18, 18))
 for i, (name, label) in enumerate([("original", "Original"), ("balanced", "Balanced"), ("strong", "Strong")]):
-    src = Image.fromarray(color8) if name == "original" else Image.fromarray(img[name])
-    strip.paste(src.crop(box), (i * 388, 34))
+    src_img = Image.fromarray(color8) if name == "original" else Image.fromarray(img[name])
+    strip.paste(src_img.crop(box), (i * 388, 34))
     ImageDraw.Draw(strip).text((i * 388 + 8, 10), label, fill=(235, 235, 235))
 strip.save(os.path.join(OUT, "comparison.png"))
+
+# Mood grid
+grid = Image.new("RGB", (3 * 427, 2 * 240 + 2 * 26), (18, 18, 18))
+for k, mood in enumerate(moods):
+    x, y = (k % 3) * 427, (k // 3) * 266
+    grid.paste(Image.fromarray(img[f"mood_{mood}"]).resize((427, 240)), (x, y + 26))
+    ImageDraw.Draw(grid).text((x + 8, y + 7), mood.replace("_", " ").capitalize(), fill=(235, 235, 235))
+grid.save(os.path.join(OUT, "moods.png"))
 
 # --------------------------------------------------------------------------------------
 # Checks
@@ -182,28 +272,80 @@ def check(cond, msg):
         failures.append(msg)
 
 
+def meandiff(a, b):
+    return float(np.abs(a.astype(np.float32) - b.astype(np.float32)).mean())
+
+
 print(f"Renderer: {ctx.info['GL_RENDERER']}")
-diffs = {k: np.abs(img[k].astype(np.float32) - src).mean() for k in ("light", "balanced", "strong")}
+print("Core look")
+diffs = {k: meandiff(img[k], src) for k in ("light", "balanced", "strong")}
 check(np.abs(img["strength_zero"].astype(np.float32) - src).max() <= 1.0, "Overall strength 0 returns the original image")
 check(diffs["light"] > 1.0, f"Light preset changes the image (mean diff {diffs['light']:.2f})")
 check(diffs["light"] < diffs["balanced"] < diffs["strong"],
       f"Presets get stronger in order ({diffs['light']:.2f} < {diffs['balanced']:.2f} < {diffs['strong']:.2f})")
+check(meandiff(img["classic"], img["balanced"]) > 1.0, "Classic games preset differs from Balanced")
 holes = int(((img["balanced"].max(-1) == 0) & (color8.max(-1) > 30)).sum())
 check(holes == 0, f"No black (NaN) pixels ({holes})")
 clipped = (img["balanced"].max(-1) >= 255).mean() * 100
 check(clipped < 2.0, f"Balanced clips under 2% of pixels ({clipped:.2f}%)")
 
-occ = 1.0 - img["debug_contact_shadows"][..., 0] / 255.0
-check(occ[:int(H * 0.05)].max() < 0.01, "No contact shadows in the sky")
-check(occ[int(H * 0.88):int(H * 0.95), int(W * 0.05):int(W * 0.25)].mean() < 0.02, "No shadows on open, flat floor")
-check(occ[int(H * 0.55):int(H * 0.75)].max() > 0.15, f"Contact shadows where objects touch the floor (max {occ[int(H * 0.55):int(H * 0.75)].max():.2f})")
+print("Depth detection")
+check(state_rises > 0.02, f"Real depth raises the depth flag ({state_rises:.3f} after one frame)")
+check(state_falls < 0.98, f"Blank depth lowers the depth flag ({state_falls:.3f} after one frame)")
 
+print("Shadows")
+occ = 1.0 - img["debug_shadows"][..., 0] / 255.0
+check(occ[:int(H * 0.05)].max() < 0.01, "No shadows in the sky")
+check(occ[int(H * 0.88):int(H * 0.95), int(W * 0.05):int(W * 0.25)].mean() < 0.02, "No shadows on open, flat floor")
+contact = occ[int(H * 0.55):int(H * 0.75)].max()
+check(contact > 0.10, f"Contact shadows where objects touch the floor (max {contact:.2f})")
+occ_nd = 1.0 - img["nodepth_debug_shadows"][..., 0] / 255.0
+check(occ_nd.max() > 0.1, f"Without depth, depth-free shadows take over (max {occ_nd.max():.2f})")
+check(meandiff(img["nodepth_balanced"], src) > 1.0, "Without depth, the look still applies")
+
+print("Skin")
 mask = img["debug_skin_mask"].astype(np.float32)
 skin = (mask[..., 0] - mask[..., 1]) > 60
 check(skin[obj == 0].mean() > 0.9, f"Skin detected on the head, lit and shadowed side ({skin[obj == 0].mean() * 100:.0f}%)")
 check(skin[obj == 1].mean() < 0.05, f"Grey ball not treated as skin ({skin[obj == 1].mean() * 100:.0f}%)")
 check(skin[sky].mean() < 0.01, "Sky not treated as skin")
 print(f"  info  Brick wall treated as skin: {skin[obj == 4].mean() * 100:.0f}% (known limitation, colour-only detection)")
+
+print("Mood and lens")
+neutral = img["mood_neutral"].astype(np.float32)
+for mood in moods[1:]:
+    check(meandiff(img[f"mood_{mood}"], neutral) > 2.0, f"Mood '{mood}' changes the image ({meandiff(img[f'mood_{mood}'], neutral):.1f})")
+
+
+colourful = (obj == 0) | (obj == 2) | (obj == 4)  # skin, wood, brick
+
+
+def saturation(a):
+    a = a.astype(np.float32)
+    return float((a.max(-1) - a.min(-1))[colourful].mean())
+
+
+def warmth(a):
+    a = a.astype(np.float32)
+    return float((a[..., 0] - a[..., 2]).mean())
+
+
+check(saturation(img["mood_survival_horror"]) < saturation(neutral), "Survival horror mutes colourful surfaces (skin, wood, brick)")
+check(warmth(img["mood_golden_hour"]) > warmth(neutral) > warmth(img["mood_cold_night"]),
+      "Golden hour is warmer and cold night cooler than neutral")
+check(meandiff(img["glow_off"], img["balanced"]) > 0.2, "Light glow changes the image")
+corner = img["lens_vignette"][:40, :40].astype(np.float32).mean() / img["balanced"][:40, :40].astype(np.float32).mean()
+check(corner < 0.9, f"Vignette darkens the corners (to {corner * 100:.0f}%)")
+check(meandiff(img["grain_frame0"], img["grain_frame7"]) > 0.5, "Film grain moves between frames")
+
+print("Status badge")
+badge = (slice(12, 102), slice(12, 410))
+check(meandiff(img["status_depth"][badge], img["balanced"][badge]) > 20, "Badge appears while the menu is open")
+check(meandiff(img["status_depth"][200:, 500:], img["balanced"][200:, 500:]) < 0.01, "Badge leaves the rest of the screen alone")
+g = img["status_depth"][badge].astype(np.float32)
+a = img["status_nodepth"][badge].astype(np.float32)
+check(((g[..., 1] - g[..., 0]) > 60).sum() > 50, "With depth, the status line is green")
+check((((a[..., 0] - a[..., 2]) > 80) & (a[..., 0] > 150)).sum() > 50, "Without depth, the status line is amber")
 
 print(f"Images saved to {OUT}")
 if failures:

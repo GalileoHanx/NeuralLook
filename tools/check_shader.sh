@@ -30,9 +30,9 @@ done
 echo "Preprocessor switches (1080p, SM5)"
 check "NL_CONTACT_SHADOWS=0"            --hlsl --width 1920 --height 1080 -D NL_CONTACT_SHADOWS=0
 check "NL_SKIN=0"                       --hlsl --width 1920 --height 1080 -D NL_SKIN=0
-check "NL_AO_SAMPLES=4"                 --hlsl --width 1920 --height 1080 -D NL_AO_SAMPLES=4
-check "NL_AO_SAMPLES=12"                --hlsl --width 1920 --height 1080 -D NL_AO_SAMPLES=12
 check "both optional phases off"        --hlsl --width 1920 --height 1080 -D NL_CONTACT_SHADOWS=0 -D NL_SKIN=0
+check "no depth passes, DirectX 9"      --hlsl --shader-model 30 --width 1920 --height 1080 -D NL_CONTACT_SHADOWS=0
+check "no depth passes, OpenGL/Vulkan"  --glsl --width 1920 --height 1080 -D NL_CONTACT_SHADOWS=0
 check "HDR colour space warning path"   --hlsl --width 1920 --height 1080 -D BUFFER_COLOR_SPACE=2
 
 if [ "$failed" -ne 0 ]; then
