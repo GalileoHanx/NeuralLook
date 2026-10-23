@@ -1,15 +1,16 @@
 name: Release
 
+# Publish a release on GitHub (Releases -> Draft a new release) and this workflow
+# checks the shader and attaches the install zip to it.
 on:
-  push:
-    tags:
-      - "v*"
+  release:
+    types: [published]
 
 permissions:
   contents: write
 
 jobs:
-  release:
+  package:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -26,8 +27,7 @@ jobs:
           cp README.md LICENSE dist/NeuralLook/
           cd dist && zip -r "NeuralLook-${GITHUB_REF_NAME}.zip" NeuralLook
 
-      - uses: softprops/action-gh-release@v2
+      - name: Attach the zip to the release
+        uses: softprops/action-gh-release@v2
         with:
           files: dist/NeuralLook-*.zip
-          generate_release_notes: true
-          prerelease: ${{ startsWith(github.ref_name, 'v0.') }}
