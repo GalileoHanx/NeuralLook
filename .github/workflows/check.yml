@@ -1,0 +1,41 @@
+name: Shader checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build ReShade's effect compiler
+        run: bash tools/build_fxc.sh build
+
+      - name: Compile every configuration
+        run: bash tools/check_shader.sh build
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install render test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libegl-mesa0 libgl1-mesa-dri
+          pip install moderngl numpy pillow
+
+      - name: Render the test scene
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          EGL_PLATFORM: surfaceless
+        run: python3 tests/render_test.py build
+
+      - name: Upload rendered images
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: render-test
+          path: build/render
